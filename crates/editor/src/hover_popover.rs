@@ -700,9 +700,10 @@ fn combine_hover_blocks(blocks: &[HoverBlock]) -> String {
             }
             project::HoverBlockKind::Code { language } => {
                 let language = language.replace(['`', '\r', '\n'], "");
+                let fence = wrapping_code_fence(text);
                 let block_budget = budget
                     .saturating_sub(separator.len() + reserved_for_dropped_marker)
-                    .saturating_sub(wrapping_code_fence(text).len() * 2)
+                    .saturating_sub(fence.len() * 2)
                     .saturating_sub(language.len() + "\n\n".len());
                 let text = match fit_in_budget(text.len(), block_budget) {
                     BudgetFit::Fits => Cow::Borrowed(text),
@@ -718,7 +719,6 @@ fn combine_hover_blocks(blocks: &[HoverBlock]) -> String {
                         ))
                     }
                 };
-                let fence = wrapping_code_fence(&text);
                 Cow::Owned(format!("{fence}{language}\n{text}\n{fence}"))
             }
         };
