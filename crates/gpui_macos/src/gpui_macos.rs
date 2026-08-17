@@ -39,7 +39,10 @@ use cocoa::{
     foundation::{NSAutoreleasePool, NSNotFound, NSString, NSUInteger},
 };
 
-use objc::runtime::{BOOL, NO, YES};
+use objc::{
+    declare::ClassDecl,
+    runtime::{BOOL, Class, NO, YES},
+};
 use std::{
     ffi::{CStr, c_char},
     ops::Range,
@@ -56,6 +59,34 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
+
+/// Register an Obj-C class under `name`, or under the first free `name_N`.
+///
+/// The Obj-C runtime has one flat class namespace per process, and
+/// `ClassDecl::new` returns `None` when the name is taken. An application can
+/// assume it owns "GPUIView"; something embedded in a host cannot. Two
+/// GPUI-based plugins in one DAW each carry their own statically linked copy of
+/// this crate, and the second to load fails every registration. These run from
+/// `#[ctor]` initializers, where a panic cannot unwind, so the failure is an
+/// `abort()` that takes the host down mid-`dlopen`.
+///
+/// Suffixing keeps the copies apart. Nothing resolves these classes by name —
+/// every use goes through the `*const Class` that registration returns — so the
+/// suffix is invisible past this function. It also means `is_gpui_view`, which
+/// compares against our own pointer, can no longer mistake another copy's view
+/// for one of ours and read its ivars as `MacWindowState`.
+pub(crate) fn declare_class(name: &str, superclass: &Class) -> ClassDecl {
+    if let Some(decl) = ClassDecl::new(name, superclass) {
+        return decl;
+    }
+    let mut suffix = 1u32;
+    loop {
+        if let Some(decl) = ClassDecl::new(&format!("{name}_{suffix}"), superclass) {
+            return decl;
+        }
+        suffix += 1;
+    }
+}
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;
