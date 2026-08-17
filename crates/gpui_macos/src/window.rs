@@ -218,6 +218,11 @@ unsafe fn build_classes() {
             );
 
             decl.add_method(
+                sel!(acceptsFirstResponder),
+                yes as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+
+            decl.add_method(
                 sel!(makeBackingLayer),
                 make_backing_layer as extern "C" fn(&Object, Sel) -> id,
             );
@@ -331,33 +336,71 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
 /// thread because it reads the active AppKit window and updates GPUI window state associated
 /// with Objective-C objects.
 pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
-    // SAFETY: The caller guarantees AppKit main-thread access. `is_gpui_window` ensures the
-    // window has our WINDOW_STATE_IVAR before reading it.
+    // SAFETY: The caller guarantees AppKit main-thread access. Every candidate
+    // view is checked to be a GPUIView before its WINDOW_STATE_IVAR is read.
     unsafe {
         let app = NSApplication::sharedApplication(nil);
         let key_window: id = msg_send![app, keyWindow];
         let main_window: id = msg_send![app, mainWindow];
-        let active_window = if !key_window.is_null() && is_gpui_window(key_window) {
-            Some(key_window)
-        } else if !main_window.is_null() && is_gpui_window(main_window) {
-            Some(main_window)
-        } else {
-            None
-        };
 
-        let Some(active_window) = active_window else {
+        // Either one of our own windows, or — when embedded in a foreign
+        // application — our view living somewhere inside one of the host's.
+        // Without the second case the cursor never updates at all, because the
+        // key window belongs to the host and is not a GPUI window.
+        let view = [key_window, main_window]
+            .into_iter()
+            .filter(|window| !window.is_null())
+            .find_map(|window| {
+                if is_gpui_window(window) {
+                    Some(get_window_state(&*window).lock().native_view.as_ptr())
+                } else {
+                    find_gpui_view(msg_send![window, contentView])
+                }
+            });
+
+        let Some(view) = view else {
             return;
         };
 
-        let window_state = get_window_state(&*active_window);
+        let window_state = get_window_state(&*view);
         let mut window_state = window_state.lock();
         if window_state.cursor_style != style {
             window_state.cursor_style = style;
-            let _: () = msg_send![
-                window_state.native_window,
-                invalidateCursorRectsForView: window_state.native_view.as_ptr()
-            ];
+            // Cursor rects belong to whichever window the view actually lives
+            // in, which is the host's when embedded — not `native_window`.
+            let owning_window: id = msg_send![view, window];
+            if owning_window != nil {
+                let _: () = msg_send![owning_window, invalidateCursorRectsForView: view];
+            }
         }
+    }
+}
+
+unsafe fn is_gpui_view(view: id) -> bool {
+    unsafe { msg_send![view, isKindOfClass: VIEW_CLASS] }
+}
+
+/// Depth-first search for a GPUIView beneath `view`.
+///
+/// An embedded view is a subview of whatever the host handed us, which may sit
+/// at any depth in the host's own hierarchy.
+unsafe fn find_gpui_view(view: id) -> Option<id> {
+    unsafe {
+        if view.is_null() {
+            return None;
+        }
+        if is_gpui_view(view) {
+            return Some(view);
+        }
+        let subviews: id = msg_send![view, subviews];
+        if subviews.is_null() {
+            return None;
+        }
+        let count: NSUInteger = msg_send![subviews, count];
+        (0..count).find_map(|i| {
+            let subview: id = msg_send![subviews, objectAtIndex: i];
+            find_gpui_view(subview)
+        })
     }
 }
 
@@ -503,6 +546,11 @@ struct MacWindowState {
     background_executor: BackgroundExecutor,
     native_window: id,
     native_view: NonNull<Object>,
+    /// True when `native_view` has been moved into a foreign application's view
+    /// hierarchy. The window still exists (GPUI's renderer, display link and
+    /// input handling all hang off it) but it is never shown, so anything that
+    /// derives geometry or visibility from it has to consult the view instead.
+    embedded: bool,
     blurred_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
@@ -669,16 +717,45 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
-        unsafe {
-            if !self
-                .native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-            {
+
+        // Frame pacing has to follow whichever window is actually on screen.
+        // When embedded that is the host's, never ours.
+        let reference_window = if self.embedded {
+            let host_window: id = unsafe { msg_send![self.native_view.as_ptr(), window] };
+            if host_window == nil {
+                // Not in the host's hierarchy yet; `display_layer` restarts the
+                // link after every frame it draws, so this recovers on its own.
                 return;
             }
+            host_window
+        } else {
+            self.native_window
+        };
+
+        // Occlusion is deliberately not consulted when embedded. It reports a
+        // window as visible only once the owning app is active and AppKit has
+        // caught up, and an embedded view's frames are not ours to gate on
+        // that — the host decides whether we are on screen, and if we are not,
+        // it simply stops asking us to draw. Gating here meant the link never
+        // started at all, leaving the first frame on screen forever.
+        if !self.embedded {
+            unsafe {
+                if !reference_window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+                {
+                    return;
+                }
+            }
         }
-        let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
+
+        let mut screen = unsafe { reference_window.screen() };
+        if screen == nil && self.embedded {
+            // A host window can briefly report no screen; any display will do
+            // to pace frames until it settles.
+            screen = unsafe { NSScreen::mainScreen(nil) };
+        }
+        let Some(display_id) = display_id_for_screen(screen) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
             return;
         };
@@ -740,12 +817,26 @@ impl MacWindowState {
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        let NSSize { width, height, .. } =
-            unsafe { NSView::frame(self.native_window.contentView()) }.size;
+        // When embedded our view is not the window's content view; it is a
+        // subview of the host's, and the host is what decides our size.
+        let view = if self.embedded {
+            self.native_view.as_ptr()
+        } else {
+            unsafe { self.native_window.contentView() }
+        };
+        let NSSize { width, height, .. } = unsafe { NSView::frame(view) }.size;
         size(px(width as f32), px(height as f32))
     }
 
     fn scale_factor(&self) -> f32 {
+        if self.embedded {
+            // Follow the host's window, which is the screen we actually render
+            // on; our own window is never displayed.
+            let host_window: id = unsafe { msg_send![self.native_view.as_ptr(), window] };
+            if host_window != nil {
+                return get_scale_factor(host_window);
+            }
+        }
         get_scale_factor(self.native_window)
     }
 
@@ -767,6 +858,7 @@ impl MacWindow {
         handle: AnyWindowHandle,
         WindowParams {
             bounds,
+            parent,
             titlebar,
             kind,
             is_movable,
@@ -899,6 +991,7 @@ impl MacWindow {
                 background_executor,
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
+                embedded: false,
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
@@ -1091,7 +1184,49 @@ impl MacWindow {
                 }
             }
 
-            if focus && show {
+            // Embedding: hand our view to the host instead of showing a window
+            // of our own. Everything else about the window stays intact — the
+            // renderer, display link, and all input handling hang off the view,
+            // which keeps working once it is reparented.
+            if let Some(raw_window_handle::RawWindowHandle::AppKit(host)) = parent {
+                let host_view = host.ns_view.as_ptr() as id;
+
+                let _: () = msg_send![native_view, removeFromSuperview];
+                let _: () = msg_send![host_view, addSubview: native_view];
+
+                // Fill the host's view and keep filling it as it resizes; the
+                // view's own `setFrameSize:` handler does the rest.
+                let host_bounds: NSRect = msg_send![host_view, bounds];
+                let _: () = msg_send![native_view, setFrame: host_bounds];
+                const NS_VIEW_WIDTH_SIZABLE: NSUInteger = 2;
+                const NS_VIEW_HEIGHT_SIZABLE: NSUInteger = 16;
+                let _: () = msg_send![
+                    native_view,
+                    setAutoresizingMask: NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE
+                ];
+
+                // Hover and cursor updates need mouse-moved events, which are a
+                // per-window opt-in and this is the host's window now.
+                let host_window: id = msg_send![host_view, window];
+                if host_window != nil {
+                    let _: () = msg_send![host_window, setAcceptsMouseMovedEvents: YES];
+                }
+
+                // Focus lives in the host's window now. Without this, keyDown:
+                // and IME never reach us and the window sends us no
+                // mouseMoved: events either, so hover would be dead too.
+                if host_window != nil {
+                    let _: () = msg_send![host_window, makeFirstResponder: native_view];
+                }
+
+                {
+                    let mut window_state = window.0.lock();
+                    window_state.embedded = true;
+                    window_state.start_display_link();
+                }
+
+                // Deliberately never ordered front.
+            } else if focus && show {
                 native_window.makeKeyAndOrderFront_(nil);
             } else if show {
                 native_window.orderFront_(nil);
@@ -1181,6 +1316,23 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+
+        // Disarm frame delivery first. Dropping the frame source below does not
+        // recall a tick that is already queued on the main queue, and `step`
+        // would then invoke this callback against a renderer that no longer
+        // exists. Leaving `None` behind makes such a tick a no-op.
+        this.request_frame_callback.take();
+
+        // An embedded view lives in a hierarchy we do not own, and nothing else
+        // here would take it out of it. Leaving it in place lets AppKit keep
+        // asking a view whose renderer and frame source are about to be
+        // destroyed to draw itself, which aborts the host process.
+        if this.embedded {
+            unsafe {
+                let _: () = msg_send![this.native_view.as_ptr(), removeFromSuperview];
+            }
+        }
+
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -1471,6 +1623,18 @@ impl PlatformWindow for MacWindow {
 
     fn activate(&self) {
         let lock = self.0.lock();
+        if lock.embedded {
+            // Ordering our hidden window front would be visible and wrong.
+            // Activating an embedded view means taking focus where it lives.
+            unsafe {
+                let view = lock.native_view.as_ptr();
+                let host_window: id = msg_send![view, window];
+                if host_window != nil {
+                    let _: () = msg_send![host_window, makeFirstResponder: view];
+                }
+            }
+            return;
+        }
         let window = lock.native_window;
         let closed = lock.closed.clone();
         let executor = lock.foreground_executor.clone();
@@ -1502,7 +1666,22 @@ impl PlatformWindow for MacWindow {
     }
 
     fn is_active(&self) -> bool {
-        unsafe { self.0.lock().native_window.isKeyWindow() == YES }
+        let lock = self.0.lock();
+        unsafe {
+            if lock.embedded {
+                // Our own window is never key. We are active when the host's
+                // window is key and we hold first responder within it.
+                let view = lock.native_view.as_ptr();
+                let host_window: id = msg_send![view, window];
+                if host_window == nil {
+                    return false;
+                }
+                let is_key: BOOL = msg_send![host_window, isKeyWindow];
+                let first_responder: id = msg_send![host_window, firstResponder];
+                return is_key == YES && first_responder == view;
+            }
+            lock.native_window.isKeyWindow() == YES
+        }
     }
 
     // is_hovered is unused on macOS. See Window::is_window_hovered.
@@ -2403,6 +2582,23 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             // be started later, once the pointer leaves the window.
             lock.last_left_mouse_down_event =
                 unsafe { Retained::retain(native_event.cast::<Objc2Object>()) };
+
+            // AppKit does not move first-responder status on a plain view
+            // click. When embedded we share the host's window with the host's
+            // own controls, so clicking us has to take focus back or keyboard
+            // and hover would stay wherever the user last clicked.
+            if lock.embedded {
+                unsafe {
+                    let view = lock.native_view.as_ptr();
+                    let host_window: id = msg_send![view, window];
+                    if host_window != nil {
+                        let first_responder: id = msg_send![host_window, firstResponder];
+                        if first_responder != view {
+                            let _: () = msg_send![host_window, makeFirstResponder: view];
+                        }
+                    }
+                }
+            }
         }
         NSEventType::NSLeftMouseUp => {
             lock.last_left_mouse_down_event = None;
@@ -2552,6 +2748,12 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let lock = &mut *window_state.lock();
+    if lock.embedded {
+        // Our window is deliberately never on screen, so its occlusion state
+        // says nothing about whether the view is visible. Killing the display
+        // link here would stop rendering entirely.
+        return;
+    }
     unsafe {
         if lock
             .native_window

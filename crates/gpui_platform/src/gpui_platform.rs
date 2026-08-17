@@ -24,6 +24,16 @@ pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }
 
+/// An application for embedding inside a host that owns the run loop, such as
+/// an audio plugin loaded by a DAW.
+///
+/// Drive it with [`gpui::Application::run_embedded`] rather than `run`, and call
+/// it from the host's main thread.
+#[cfg(target_os = "macos")]
+pub fn embedded() -> gpui::Application {
+    gpui::Application::with_platform(Rc::new(gpui_macos::MacPlatform::new_embedded()))
+}
+
 #[cfg(target_family = "wasm")]
 pub use gpui_web::WebBackendPreference;
 

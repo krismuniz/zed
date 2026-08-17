@@ -1333,6 +1333,7 @@ impl Window {
     ) -> Result<Self> {
         let WindowOptions {
             window_bounds,
+            parent,
             titlebar,
             focus,
             show,
@@ -1364,6 +1365,7 @@ impl Window {
             handle,
             WindowParams {
                 bounds: window_bounds.get_bounds(),
+                parent,
                 titlebar,
                 kind,
                 is_movable,

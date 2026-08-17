@@ -171,6 +171,12 @@ pub(crate) struct MacPlatformState {
     text_system: Arc<dyn PlatformTextSystem>,
     renderer_context: renderer::Context,
     headless: bool,
+    /// True when GPUI is hosted inside a foreign application that owns
+    /// `NSApplication` and the main run loop (e.g. an audio plugin loaded by a
+    /// DAW). In this mode we must not install an app delegate, must not call
+    /// `[NSApp run]`, and must not perform any application-lifetime action —
+    /// those belong to the host, and taking them would terminate or hide it.
+    embedded: bool,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
     reopen: Option<Box<dyn FnMut()>>,
@@ -195,6 +201,22 @@ pub(crate) struct MacPlatformState {
 
 impl MacPlatform {
     pub fn new(headless: bool) -> Self {
+        Self::new_with_mode(headless, false)
+    }
+
+    /// Builds a platform for embedding inside a host application that already
+    /// owns `NSApplication` and the main run loop.
+    ///
+    /// Pair this with [`gpui::Application::run_embedded`]: `run` invokes the
+    /// launch callback and returns immediately instead of blocking, leaving the
+    /// host to drive the run loop. GPUI's own plumbing is already host-agnostic
+    /// — foreground work is dispatched onto the libdispatch main queue and
+    /// frames are paced by `CVDisplayLink`, neither of which needs `[NSApp run]`.
+    pub fn new_embedded() -> Self {
+        Self::new_with_mode(false, true)
+    }
+
+    fn new_with_mode(headless: bool, embedded: bool) -> Self {
         let dispatcher = Arc::new(MacDispatcher::new());
 
         #[cfg(feature = "font-kit")]
@@ -215,6 +237,7 @@ impl MacPlatform {
 
         Self(Mutex::new(MacPlatformState {
             headless,
+            embedded,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
@@ -490,6 +513,14 @@ impl Platform for MacPlatform {
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
         let mut state = self.0.lock();
+        if state.embedded {
+            // The host already called `[NSApp run]`. Launch synchronously and
+            // hand control straight back; from here on, GPUI is driven by the
+            // host's run loop via the main dispatch queue.
+            drop(state);
+            on_finish_launching();
+            return;
+        }
         if state.headless {
             drop(state);
             on_finish_launching();
@@ -518,6 +549,13 @@ impl Platform for MacPlatform {
     }
 
     fn quit(&self) {
+        if self.0.lock().embedded {
+            // `[NSApp terminate:]` here would quit the host application. An
+            // embedded GPUI instance goes away when its windows are closed and
+            // the embedder drops its `ApplicationHandle`.
+            return;
+        }
+
         // Quitting the app causes us to close windows, which invokes `Window::on_close` callbacks
         // synchronously before this method terminates. If we call `Platform::quit` while holding a
         // borrow of the app state (which most of the time we will do), we will end up
@@ -538,6 +576,11 @@ impl Platform for MacPlatform {
     }
 
     fn restart(&self, binary_path: Option<PathBuf>) {
+        if self.0.lock().embedded {
+            // Would relaunch the host's binary.
+            return;
+        }
+
         use std::os::unix::process::CommandExt as _;
 
         let app_pid = std::process::id().to_string();
@@ -579,6 +622,11 @@ impl Platform for MacPlatform {
     }
 
     fn activate(&self, ignoring_other_apps: bool) {
+        if self.0.lock().embedded {
+            // Activation belongs to the host; yanking it here would pull focus
+            // away from whatever the user was actually doing.
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             app.activateIgnoringOtherApps_(ignoring_other_apps.to_objc());
@@ -586,6 +634,10 @@ impl Platform for MacPlatform {
     }
 
     fn hide(&self) {
+        if self.0.lock().embedded {
+            // Would hide the host application, not us.
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, hide: nil];
@@ -593,6 +645,9 @@ impl Platform for MacPlatform {
     }
 
     fn hide_other_apps(&self) {
+        if self.0.lock().embedded {
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, hideOtherApplications: nil];
@@ -600,6 +655,9 @@ impl Platform for MacPlatform {
     }
 
     fn unhide_other_apps(&self) {
+        if self.0.lock().embedded {
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, unhideAllApplications: nil];

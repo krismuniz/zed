@@ -1797,6 +1797,16 @@ pub struct WindowOptions {
     /// - `Some(WindowBounds)`: Open a window with corresponding state and its restore size.
     pub window_bounds: Option<WindowBounds>,
 
+    /// Embed this window's content inside an existing native view owned by
+    /// another application, instead of showing it as a top-level window.
+    ///
+    /// Intended for hosting GPUI inside a foreign application — an audio plugin
+    /// in a DAW, for instance — where the host hands the guest a view to draw
+    /// into. Pair with [`crate::Application::run_embedded`].
+    ///
+    /// Currently implemented on macOS (`RawWindowHandle::AppKit`).
+    pub parent: Option<raw_window_handle::RawWindowHandle>,
+
     /// The titlebar configuration of the window
     pub titlebar: Option<TitlebarOptions>,
 
@@ -1869,6 +1879,13 @@ pub struct WindowOptions {
 #[allow(missing_docs)]
 pub struct WindowParams {
     pub bounds: Bounds<Pixels>,
+
+    /// See [`WindowOptions::parent`].
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+        allow(dead_code)
+    )]
+    pub parent: Option<raw_window_handle::RawWindowHandle>,
 
     /// The titlebar configuration of the window
     #[cfg_attr(feature = "wayland", allow(dead_code))]
@@ -1961,6 +1978,7 @@ impl Default for WindowOptions {
     fn default() -> Self {
         Self {
             window_bounds: None,
+            parent: None,
             titlebar: Some(TitlebarOptions {
                 title: Default::default(),
                 appears_transparent: Default::default(),
