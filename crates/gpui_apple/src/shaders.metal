@@ -25,9 +25,12 @@ float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
 float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
+bool corner_is_circular(float corner_radius, float2 half_size);
+float squircle_sdf(float2 corner_center_to_point, float corner_radius);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
-float quad_sdf_impl(float2 center_to_point, float corner_radius);
+float quad_sdf_impl(float2 center_to_point, float corner_radius,
+                    float2 half_size);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
@@ -179,7 +182,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   // Signed distance of the point to the outside edge of the quad's border
-  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, half_size);
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -1068,14 +1071,69 @@ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
     float corner_radius = pick_corner_radius(center_to_point, corner_radii);
     float2 corner_to_point = fabs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    return quad_sdf_impl(corner_center_to_point, corner_radius, half_size);
+}
+
+// Whether a corner is a circle, rather than something with a corner to smooth.
+//
+// A radius that reaches half the shorter side has eaten the whole side: the
+// shape is a circle or a pill, its curvature is already constant, and there is
+// no step between straight and round for a squircle to take out. Smoothing one
+// would only make it smaller.
+//
+// Every radius arrives here already clamped to this bound by
+// `clamp_radii_for_quad_size`, so `rounded_full` lands exactly on it. The half
+// pixel of slack absorbs the bounds snapping that happens after the clamp.
+bool corner_is_circular(float corner_radius, float2 half_size) {
+    return corner_radius >= fmin(half_size.x, half_size.y) - 0.5;
+}
+
+// Signed distance to the squircle |x|^4 + |y|^4 = corner_radius^4, for a point
+// in the corner's own quadrant, where both components are >= 0.
+//
+// This is the shape the whole change is for. A circular corner meets the
+// straight edge with its curvature jumping from 0 to 1/radius in one step, and
+// the eye reads that step as the corner bulging out of the rectangle. The
+// fourth power takes the curvature up from zero and back down to zero again,
+// so there is no step left to see.
+//
+// The 4-norm on its own has the right shape and the wrong rate. It is a level
+// set, not a distance: it grows about 16% slower along the diagonal than it
+// does across the flats. Two callers read this number as a real distance --
+// antialiasing compares it against half a pixel, and a uniform border is drawn
+// by offsetting it inward -- and both would be wrong by that factor through the
+// middle of the corner. Dividing by the length of the gradient is one Newton
+// step towards the true distance, and it is exact where the value is zero,
+// which is the only place either caller looks closely.
+//
+// The divisor stays between 0.84 and 1 over the quadrant, so it never needs
+// guarding against zero.
+float squircle_sdf(float2 corner_center_to_point, float corner_radius) {
+    float2 cubed = corner_center_to_point * corner_center_to_point *
+                   corner_center_to_point;
+    float sum_of_fourths = dot(cubed, corner_center_to_point);
+    if (sum_of_fourths <= 0.0) {
+        return -corner_radius;
+    }
+    float norm = sqrt(sqrt(sum_of_fourths));
+    float gradient_length = length(cubed) / (norm * norm * norm);
+    return (norm - corner_radius) / gradient_length;
 }
 
 // Implementation of quad signed distance field
-float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius,
+                    float2 half_size) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
         return max(corner_center_to_point.x, corner_center_to_point.y);
+    } else if (corner_center_to_point.x > 0.0 &&
+               corner_center_to_point.y > 0.0 &&
+               !corner_is_circular(corner_radius, half_size)) {
+        // Inside the corner's own quadrant, which is the only place the two
+        // shapes differ. Along either edge of this quadrant the squircle and
+        // the circle agree exactly -- both reduce to the distance to the
+        // straight side -- so the branch is seamless.
+        return squircle_sdf(corner_center_to_point, corner_radius);
     } else {
         // Signed distance of the point from a quad that is inset by corner_radius
         // It is negative inside this quad, and positive outside

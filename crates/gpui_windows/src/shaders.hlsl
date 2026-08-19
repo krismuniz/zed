@@ -286,11 +286,40 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds bounds,
     return float4(device_position, 0.0, 1.0);
 }
 
+// Whether a corner is a circle, rather than something with a corner to smooth.
+// A radius that reaches half the shorter side has eaten the whole side, so the
+// shape is a pill or a dot and its curvature is already constant.
+bool corner_is_circular(float corner_radius, float2 half_size) {
+    return corner_radius >= min(half_size.x, half_size.y) - 0.5;
+}
+
+// Signed distance to the squircle |x|^4 + |y|^4 = corner_radius^4, for a point
+// in the corner's own quadrant. See `shaders.metal` for why the fourth power,
+// and for what the divisor is correcting.
+float squircle_sdf(float2 corner_center_to_point, float corner_radius) {
+    float2 cubed = corner_center_to_point * corner_center_to_point *
+                   corner_center_to_point;
+    float sum_of_fourths = dot(cubed, corner_center_to_point);
+    if (sum_of_fourths <= 0.0) {
+        return -corner_radius;
+    }
+    float norm = sqrt(sqrt(sum_of_fourths));
+    float gradient_length = length(cubed) / (norm * norm * norm);
+    return (norm - corner_radius) / gradient_length;
+}
+
 // Implementation of quad signed distance field
-float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius,
+                    float2 half_size) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
         return max(corner_center_to_point.x, corner_center_to_point.y);
+    } else if (corner_center_to_point.x > 0.0 &&
+               corner_center_to_point.y > 0.0 &&
+               !corner_is_circular(corner_radius, half_size)) {
+        // The corner's own quadrant, which is the only place the two shapes
+        // differ. Along either edge of it they agree exactly.
+        return squircle_sdf(corner_center_to_point, corner_radius);
     } else {
         // Signed distance of the point from a quad that is inset by corner_radius
         // It is negative inside this quad, and positive outside
@@ -311,7 +340,7 @@ float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
     float corner_radius = pick_corner_radius(center_to_point, corner_radii);
     float2 corner_to_point = abs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    return quad_sdf_impl(corner_center_to_point, corner_radius, half_size);
 }
 
 GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
@@ -635,7 +664,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     }
 
     // Signed distance of the point to the outside edge of the quad's border
-    float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, half_size);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
