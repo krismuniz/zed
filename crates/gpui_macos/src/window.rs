@@ -2432,6 +2432,10 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     let mut lock = window_state.as_ref().lock();
 
     let window_height = lock.content_size().height;
+    // Read before the arms drop the lock. An embedded view shares its window
+    // with a host that has its own keyboard shortcuts, so a key nothing here
+    // wanted is not ours to throw away — see `pass_to_next_responder`.
+    let embedded = lock.embedded;
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     let Some(event) = event else {
@@ -2524,12 +2528,36 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 }
 
                 let handled = run_callback(PlatformInput::KeyDown(key_down_event));
+                if handled == NO && embedded && !key_equivalent && !is_composing {
+                    unsafe { pass_to_next_responder(this, native_event, false) };
+                }
                 return handled;
             }
 
             let handled = run_callback(PlatformInput::KeyDown(key_down_event.clone()));
             if handled == YES {
                 return YES;
+            }
+
+            // Embedded, a key nothing here claimed belongs to whoever owns the
+            // window we are drawn in. A DAW's transport lives on the space bar,
+            // and the only way it hears about one pressed over a plugin's view
+            // is the rest of the responder chain.
+            //
+            // Ahead of the input context deliberately. That would answer YES to
+            // an ordinary character whether or not anything consumed it — with
+            // no input handler installed, `insertText:` reaches nobody and is
+            // still reported as handled — so a key routed through it dies here
+            // with nothing to show for it. Skipped when there *is* an input
+            // handler: a focused text field is exactly the case where a plain
+            // character is wanted, and the IME below is how it arrives.
+            //
+            // Not for a key equivalent. AppKit continues its own dispatch as
+            // soon as we answer NO, so forwarding one as well delivers it
+            // twice.
+            if embedded && !key_equivalent && with_input_handler(this, |_| ()).is_none() {
+                unsafe { pass_to_next_responder(this, native_event, false) };
+                return NO;
             }
 
             if key_down_event.is_held
@@ -2561,10 +2589,42 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 
         PlatformInput::KeyUp(_) => {
             drop(lock);
-            run_callback(event)
+            let handled = run_callback(event);
+            // Pass the release on for the same reason as the press, and so the
+            // host is never left holding a key it saw go down and never come up.
+            if handled == NO && embedded && !key_equivalent {
+                unsafe { pass_to_next_responder(this, native_event, true) };
+            }
+            handled
         }
 
         _ => NO,
+    }
+}
+
+/// Hands a key event we did not use to the responder above us.
+///
+/// `NSResponder`'s own implementation of these methods is exactly this walk, so
+/// calling it on our superclass continues the chain from where we sit — up
+/// through the host's views to its window, which is where a foreign application
+/// keeps its shortcuts. Reached only when embedded: a GPUI application *is* the
+/// whole chain, so there is nobody above to pass to, and the event is dropped as
+/// it always was.
+///
+/// If nothing up there wants it either, AppKit ends the walk in `noResponderFor:`
+/// and beeps. That is the standard behaviour of an unhandled key on this
+/// platform, and the alternative — a silent drop — is what made the host look
+/// deaf in the first place.
+/// `key_up` picks which of the two messages to send. A `Sel` passed through
+/// `performSelector:` would look tidier and would be a loop: that dispatches
+/// from the object's own class, which is the method we are standing in.
+unsafe fn pass_to_next_responder(this: &Object, native_event: id, key_up: bool) {
+    unsafe {
+        if key_up {
+            let _: () = msg_send![super(this, class!(NSView)), keyUp: native_event];
+        } else {
+            let _: () = msg_send![super(this, class!(NSView)), keyDown: native_event];
+        }
     }
 }
 
